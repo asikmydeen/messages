@@ -57,18 +57,22 @@ function parseNotifications(list, postedAt) {
   return rows
 }
 
+// Real termux-sms-list schema: threadid, address/number, received ("YYYY-MM-DD HH:MM:SS"), body.
+// Older builds use threadID + epoch date — support both.
 function parseSms(list, postedAt) {
   const rows = []
   for (const m of Array.isArray(list) ? list : []) {
     const body = (m.body || '').trim()
     if (!body) continue
-    const when = m.date ? new Date(Number(m.date)).toISOString().replace('T', ' ').slice(0, 19) : ''
+    const thread = m.threadid ?? m.threadID ?? ''
+    const addr = m.address || m.number || ''
+    const when = m.received || (m.date ? new Date(Number(m.date)).toISOString().replace('T', ' ').slice(0, 19) : '')
     rows.push({
-      dedup_key: sha(`sms|${m.smsID ?? ''}|${m.threadID}|${m.address}|${body}|${m.date ?? ''}`),
+      dedup_key: sha(`sms|${thread}|${addr}|${body}|${when}`),
       source: 'sms',
       app: 'sms',
-      title: m.person || m.address || 'SMS',
-      sender: m.address || '',
+      title: m.person || addr || 'SMS',
+      sender: addr,
       body,
       msg_time: when,
       posted_at: m.date ? Number(m.date) : postedAt,

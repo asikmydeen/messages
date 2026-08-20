@@ -150,8 +150,12 @@ app.post('/ingest/raw', async (c) => {
   }
 })
 
-// Auth: Basic header, session cookie, or one-time login link /?key=<password>
+// Auth: Basic header, session cookie, or login link /?key=<password>.
+// On any Basic-auth success we ALSO plant the session cookie — some browsers
+// (Samsung Internet, in-app webviews) don't attach Basic auth to fetch() calls,
+// which broke the feed's background data loads.
 const COOKIE_VAL = FEED_PASS ? crypto.createHash('sha256').update(`mh:${FEED_USER}:${FEED_PASS}`).digest('hex') : ''
+const SET_COOKIE = `mh_auth=${COOKIE_VAL}; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax`
 
 app.use('*', async (c, next) => {
   if (!FEED_PASS) return next()
@@ -160,10 +164,13 @@ app.use('*', async (c, next) => {
   const basicOk = got.length === expected.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected))
   const cookie = c.req.header('Cookie') || ''
   const cookieOk = cookie.includes(`mh_auth=${COOKIE_VAL}`)
-  if (basicOk || cookieOk) return next()
+  if (basicOk || cookieOk) {
+    if (basicOk && !cookieOk) c.header('Set-Cookie', SET_COOKIE)
+    return next()
+  }
   const key = c.req.query('key') || ''
   if (key && (key === FEED_PASS || key === `${FEED_USER}:${FEED_PASS}`)) {
-    c.header('Set-Cookie', `mh_auth=${COOKIE_VAL}; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax`)
+    c.header('Set-Cookie', SET_COOKIE)
     return next()
   }
   return c.body('Unauthorized — open your login link: messages.asikmydeen.com/?key=<feed password>', 401, { 'WWW-Authenticate': 'Basic realm="messages"' })
@@ -219,7 +226,7 @@ button{background:#2b6cb0;color:#fff;border:0;border-radius:8px;padding:8px 14px
 .b{white-space:pre-wrap;word-break:break-word}
 #count{color:#8296ab;font-size:12.5px;margin:0 0 10px}
 </style></head><body>
-<h1>📨 messages</h1>
+<h1>messages</h1>
 <form onsubmit="return go(event)"><input id=q placeholder="search…"><button>Search</button></form>
 <div class=chips id=chips></div>
 <p id=count></p><div id=list></div>
@@ -230,7 +237,7 @@ async function load(){
   const q=document.getElementById('q').value
   const u=new URL('/messages',location);u.searchParams.set('limit','200')
   if(q)u.searchParams.set('q',q); if(app)u.searchParams.set('app',app)
-  const r=await fetch(u)
+  const r=await fetch(u,{credentials:'same-origin'})
   if(r.status===401){document.getElementById('list').innerHTML='<div class=msg>Session expired — reopen your login link.</div>';return}
   const d=await r.json()
   document.getElementById('count').textContent=(d.total??0)+' messages'
@@ -238,7 +245,7 @@ async function load(){
     '<div class=msg><div class=meta><span class="src '+m.source+'">'+esc(m.source)+'</span><span class=t>'+esc(m.title)+'</span><span>'+esc(m.app)+'</span><span>'+esc(m.msg_time)+'</span></div><div class=b>'+esc(m.body)+'</div></div>').join('')
 }
 async function chips(){
-  const r=await fetch('/apps')
+  const r=await fetch('/apps',{credentials:'same-origin'})
   if(!r.ok)return
   const d=await r.json()
   document.getElementById('chips').innerHTML='<span class="chip'+(app?'':' on')+'" onclick="pick(\'\')">all</span>'+

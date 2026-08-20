@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import crypto from 'node:crypto'
+import { fetchGmail } from './gmail.js'
 
 const PORT = Number(process.env.PORT || 3000)
 const INGEST_TOKEN = process.env.INGEST_TOKEN || ''
@@ -10,6 +11,8 @@ const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '')
 const SB_KEY = process.env.SUPABASE_ANON_KEY || ''
 const QDRANT_URL = (process.env.QDRANT_URL || '').replace(/\/$/, '')
 const OLLAMA_URL = (process.env.OLLAMA_URL || '').replace(/\/$/, '')
+const GMAIL_USER = process.env.GMAIL_USER || ''
+const GMAIL_PASS = process.env.GMAIL_APP_PASSWORD || ''
 
 if (!INGEST_TOKEN || !SB_URL || !SB_KEY) {
   console.error('missing env: INGEST_TOKEN / SUPABASE_URL / SUPABASE_ANON_KEY')
@@ -137,7 +140,7 @@ async function fetchRecent(limit = 500) {
 async function embedAndStore(rows) {
   if (!QDRANT_URL || !OLLAMA_URL || !rows.length) return 0
   try {
-    const texts = rows.map((r) => `${r.title ? r.title + '\n' : ''}${r.body}`)
+    const texts = rows.map((r) => `${r.title ? r.title + '\n' : ''}${String(r.body || '').slice(0, 1500)}`)
     const er = await fetch(`${OLLAMA_URL}/api/embed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -163,9 +166,64 @@ async function embedAndStore(rows) {
   }
 }
 
+// ---- Gmail sync (daily + backfill) ----
+const gmailStatus = { running: false, lastRun: null, lastOk: null, fetched: 0, inserted: 0, embedded: 0, error: null }
+
+async function getSyncState(key) {
+  const r = await pgr(`sync_state?select=value&key=eq.${key}`)
+  const rows = await r.json()
+  return rows && rows[0] ? rows[0].value : null
+}
+
+async function setSyncState(key, value) {
+  await pgr('sync_state?on_conflict=key', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates' },
+    body: JSON.stringify({ key, value: String(value) }),
+  })
+}
+
+async function runGmailSync(reason) {
+  if (!GMAIL_USER || !GMAIL_PASS) { gmailStatus.error = 'no gmail credentials configured'; return }
+  if (gmailStatus.running) return
+  gmailStatus.running = true
+  gmailStatus.error = null
+  gmailStatus.fetched = gmailStatus.inserted = gmailStatus.embedded = 0
+  const startedAt = new Date().toISOString()
+  try {
+    const last = await getSyncState('gmail_last_date')
+    // first run = 6-month backfill; afterwards daily increment (1-day overlap, dedup makes it safe)
+    const since = last ? new Date(Number(last) - 86400000) : new Date(Date.now() - 182 * 86400000)
+    const rows = await fetchGmail({
+      user: GMAIL_USER, pass: GMAIL_PASS, since,
+      onProgress: (done, total) => { gmailStatus.fetched = done; gmailStatus.total = total },
+    })
+    gmailStatus.fetched = rows.length
+    const insertedKeys = await insertRows(rows)
+    gmailStatus.inserted = insertedKeys.length
+    let embedded = 0
+    if (insertedKeys.length) {
+      const newRows = rows.filter((r) => insertedKeys.includes(r.dedup_key))
+      for (let i = 0; i < newRows.length; i += 32) {
+        embedded += await embedAndStore(newRows.slice(i, i + 32))
+      }
+    }
+    gmailStatus.embedded = embedded
+    await setSyncState('gmail_last_date', Date.now())
+    gmailStatus.lastOk = new Date().toISOString()
+    console.log(`gmail sync (${reason}): fetched=${rows.length} inserted=${insertedKeys.length} embedded=${embedded}`)
+  } catch (e) {
+    gmailStatus.error = String(e.message || e)
+    console.error('gmail sync failed:', gmailStatus.error)
+  } finally {
+    gmailStatus.lastRun = startedAt
+    gmailStatus.running = false
+  }
+}
+
 const app = new Hono()
 
-app.get('/health', (c) => c.json({ ok: true }))
+app.get('/health', (c) => c.json({ ok: true, gmail: GMAIL_USER ? { running: gmailStatus.running, lastOk: gmailStatus.lastOk } : null }))
 
 app.use('/ingest/*', async (c, next) => {
   const got = c.req.header('Authorization') || ''
@@ -202,6 +260,16 @@ app.post('/ingest/backfill', async (c) => {
     return c.json({ error: String(e.message || e) }, 502)
   }
 })
+
+// Gmail: trigger a sync now (async — poll /ingest/gmail-status).
+app.post('/ingest/gmail-sync', (c) => {
+  if (!GMAIL_USER || !GMAIL_PASS) return c.json({ error: 'gmail not configured (GMAIL_USER / GMAIL_APP_PASSWORD env)' }, 400)
+  if (gmailStatus.running) return c.json({ ...gmailStatus, note: 'already running' })
+  runGmailSync('manual').catch(() => {})
+  return c.json({ started: true })
+})
+
+app.get('/ingest/gmail-status', (c) => c.json(gmailStatus))
 
 // Auth: Basic header, session cookie, or login link /?key=<password>.
 // On any Basic-auth success we ALSO plant the session cookie — some browsers
@@ -280,6 +348,7 @@ button{background:#2b6cb0;color:#fff;border:0;border-radius:8px;padding:8px 14px
 .meta{font-size:11.5px;color:#8296ab;display:flex;gap:8px;margin-bottom:4px;flex-wrap:wrap}
 .src{padding:0 6px;border-radius:4px;background:#233043;font-weight:600}
 .src.sms{background:#3a2d51}
+.src.gmail{background:#1e3a5f}
 .t{font-weight:600;margin-right:auto}
 .b{white-space:pre-wrap;word-break:break-word}
 #count{color:#8296ab;font-size:12.5px;margin:0 0 10px}
@@ -330,5 +399,9 @@ chips();load();setInterval(load,60000)
 app.get('/', (c) => c.html(PAGE))
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
-  console.log(`messages-hub on :${info.port} → ${SB_URL}${QDRANT_URL ? ' + brain(' + QDRANT_URL + ')' : ''} (encrypted at rest)`)
+  console.log(`messages-hub on :${info.port} → ${SB_URL}${QDRANT_URL ? ' + brain' : ''}${GMAIL_USER ? ' + gmail(' + GMAIL_USER + ')' : ''}`)
+  if (GMAIL_USER && GMAIL_PASS) {
+    setTimeout(() => runGmailSync('boot').catch(() => {}), 15000)
+    setInterval(() => runGmailSync('daily').catch(() => {}), 24 * 3600 * 1000)
+  }
 })

@@ -13,6 +13,30 @@ const stripHtml = (html) => html
   .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
   .replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim()
 
+// Decode a MIME part (headers+content segment) to readable text:
+// handles base64 and quoted-printable transfer encodings, then UTF-8.
+function decodePart(seg) {
+  const sp = seg.search(/\r?\n\r?\n/)
+  const phead = sp >= 0 ? seg.slice(0, sp).toLowerCase() : ''
+  let content = sp >= 0 ? seg.slice(sp).replace(/^[\s\r\n]+/, '') : seg
+  if (/content-transfer-encoding:\s*base64/.test(phead)) {
+    try {
+      content = Buffer.from(content.replace(/[^A-Za-z0-9+/=]/g, ''), 'base64').toString('utf8')
+    } catch { /* keep raw */ }
+  } else if (/content-transfer-encoding:\s*quoted-printable/.test(phead)) {
+    content = content.replace(/=\r?\n/g, '')
+    const bytes = []
+    for (let i = 0; i < content.length; i++) {
+      if (content[i] === '=' && /^[0-9A-F]{2}$/i.test(content.substr(i + 1, 2))) {
+        bytes.push(parseInt(content.substr(i + 1, 2), 16))
+        i += 2
+      } else bytes.push(content.charCodeAt(i) & 0xff)
+    }
+    try { content = Buffer.from(bytes).toString('utf8') } catch { /* keep raw */ }
+  }
+  return content.replace(/\r\n/g, '\n')
+}
+
 // Sync Gmail over IMAP: since = Date. Returns rows in hub shape.
 // Filter: skip Gmail category junk (promotions/social/forums), skip empty.
 // Two phases — envelopes+labels first, THEN body fetches. (Fetching bodies
@@ -77,6 +101,7 @@ export async function fetchGmail({ user, pass, since, onProgress }) {
 }
 
 // Text extraction from raw RFC822 source: first text/plain part, else stripped HTML.
+// All parts go through decodePart (base64 / quoted-printable aware).
 function extractFromSource(source) {
   if (!source) return ''
   const raw = Buffer.isBuffer(source) ? source.toString('utf8') : String(source)
@@ -89,17 +114,15 @@ function extractFromSource(source) {
     let html = ''
     for (const p of parts) {
       if (/content-type:\s*text\/plain/i.test(p) && !/content-disposition:\s*attachment/i.test(p)) {
-        const sp = p.search(/\r?\n\r?\n/)
-        const clean = sp >= 0 ? p.slice(sp).replace(/^\s*(\r?\n)+/, '').replace(/\r\n/g, '\n') : ''
-        if (clean.trim()) return clean.trim()
+        const decoded = decodePart(p)
+        if (decoded.trim()) return decoded.trim()
       }
-      if (/content-type:\s*text\/html/i.test(p) && !html) {
-        const sp = p.search(/\r?\n\r?\n/)
-        if (sp >= 0) html = p.slice(sp)
+      if (/content-type:\s*text\/html/i.test(p) && !html && !/content-disposition:\s*attachment/i.test(p)) {
+        html = decodePart(p)
       }
     }
     if (html) return stripHtml(html).slice(0, 5000)
   }
-  if (/content-type:\s*text\/html/i.test(headers)) return stripHtml(body).slice(0, 5000)
-  return body.replace(/\r\n/g, '\n').trim()
+  if (/content-type:\s*text\/html/i.test(headers)) return stripHtml(decodePart(raw.slice(headerEnd - 2))).slice(0, 5000)
+  return decodePart(raw.slice(headerEnd - 2)).trim()
 }

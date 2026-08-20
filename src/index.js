@@ -1,61 +1,55 @@
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
-import Database from 'better-sqlite3'
 import crypto from 'node:crypto'
-import fs from 'node:fs'
-import path from 'node:path'
 
 const PORT = Number(process.env.PORT || 3000)
-const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'messages.db')
-const INGEST_TOKEN = process.env.INGEST_TOKEN
+const INGEST_TOKEN = process.env.INGEST_TOKEN || ''
 const FEED_USER = process.env.FEED_USER || 'asik'
 const FEED_PASS = process.env.FEED_PASS || ''
+const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '')
+const SB_KEY = process.env.SUPABASE_ANON_KEY || ''
 
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
-const db = new Database(DB_PATH)
-db.pragma('journal_mode = WAL')
-db.exec(`
-  create table if not exists messages (
-    id integer primary key autoincrement,
-    dedup_key text unique not null,
-    source text not null,
-    app text,
-    title text,
-    sender text,
-    body text,
-    msg_time text,
-    posted_at integer,
-    ingested_at text default (datetime('now'))
-  );
-  create index if not exists idx_messages_app on messages(app);
-  create index if not exists idx_messages_source on messages(source);
-`)
+if (!INGEST_TOKEN || !SB_URL || !SB_KEY) {
+  console.error('missing env: INGEST_TOKEN / SUPABASE_URL / SUPABASE_ANON_KEY')
+  process.exit(1)
+}
 
-// Packages never worth capturing: Termux itself (feedback loop), system chrome.
+// AES-256-GCM key derived from the ingest token — the DB only ever sees ciphertext.
+const AES_KEY = crypto.createHash('sha256').update(`enc:${INGEST_TOKEN}`).digest()
+const enc = (s) => {
+  const iv = crypto.randomBytes(12)
+  const c = crypto.createCipheriv('aes-256-gcm', AES_KEY, iv)
+  const ct = Buffer.concat([c.update(String(s ?? ''), 'utf8'), c.final()])
+  return Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64')
+}
+const dec = (b) => {
+  try {
+    const raw = Buffer.from(String(b ?? ''), 'base64')
+    const d = crypto.createDecipheriv('aes-256-gcm', AES_KEY, raw.subarray(0, 12))
+    d.setAuthTag(raw.subarray(12, 28))
+    return Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString('utf8')
+  } catch { return '' }
+}
+
+const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 40)
+
 const DENY_APPS = new Set([
   'com.termux', 'com.termux.api', 'com.termux.boot', 'com.termux.widget',
   'com.android.systemui', 'android',
 ])
 
-const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 40)
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
-
 function parseNotifications(list, postedAt) {
   const rows = []
   for (const n of Array.isArray(list) ? list : []) {
     const app = n.packageName || 'unknown'
-    if (DENY_APPS.has(app)) continue
-    if (n.ongoing) continue
+    if (DENY_APPS.has(app) || n.ongoing) continue
     const title = (n.title || '').trim()
     const body = (n.content || n.text || '').trim()
     if (!title && !body) continue
     rows.push({
       dedup_key: sha(`${app}|${title}|${body}|${n.when || n.key || ''}`),
       source: 'notification',
-      app,
-      title,
-      sender: '',
-      body,
+      app, title, sender: '', body,
       msg_time: n.when || '',
       posted_at: postedAt,
     })
@@ -83,31 +77,58 @@ function parseSms(list, postedAt) {
   return rows
 }
 
-const insert = db.prepare(`
-  insert into messages (dedup_key, source, app, title, sender, body, msg_time, posted_at)
-  values (@dedup_key, @source, @app, @title, @sender, @body, @msg_time, @posted_at)
-  on conflict(dedup_key) do nothing
-`)
-
-function insertRows(rows) {
-  let inserted = 0
-  const tx = db.transaction((batch) => {
-    for (const r of batch) if (insert.run(r).changes) inserted++
+async function pgr(path, opts = {}) {
+  const r = await fetch(`${SB_URL}/rest/v1/${path}`, {
+    ...opts,
+    headers: {
+      apikey: SB_KEY,
+      Authorization: `Bearer ${SB_KEY}`,
+      'Content-Type': 'application/json',
+      ...(opts.headers || {}),
+    },
   })
-  tx(rows)
-  return inserted
+  if (!r.ok) throw new Error(`postgrest ${r.status}: ${(await r.text()).slice(0, 200)}`)
+  return r
+}
+
+async function insertRows(rows) {
+  if (!rows.length) return 0
+  const payload = rows.map((r) => ({
+    dedup_key: r.dedup_key, source: r.source,
+    app_enc: enc(r.app), title_enc: enc(r.title), sender_enc: enc(r.sender), body_enc: enc(r.body),
+    msg_time: r.msg_time, posted_at: r.posted_at,
+  }))
+  const r = await pgr('messages?on_conflict=dedup_key&select=id', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
+    body: JSON.stringify(payload),
+  })
+  const inserted = await r.json()
+  return Array.isArray(inserted) ? inserted.length : 0
+}
+
+async function fetchRecent(limit = 500) {
+  const r = await pgr(`messages?select=*&order=id.desc&limit=${Math.min(limit, 2000)}`, {
+    headers: { Prefer: 'count=exact' },
+  })
+  const range = r.headers.get('content-range') || '' // e.g. "0-499/1234"
+  const total = range.includes('/') ? Number(range.split('/')[1]) : null
+  const items = (await r.json()).map((m) => ({
+    id: m.id, source: m.source,
+    app: dec(m.app_enc), title: dec(m.title_enc), sender: dec(m.sender_enc), body: dec(m.body_enc),
+    msg_time: m.msg_time, posted_at: m.posted_at, ingested_at: m.ingested_at,
+  }))
+  return { items, total }
 }
 
 const app = new Hono()
 
-// Health probe: public, no auth
 app.get('/health', (c) => c.json({ ok: true }))
 
-// Ingest: Bearer token
 app.use('/ingest/*', async (c, next) => {
   const got = c.req.header('Authorization') || ''
   const want = `Bearer ${INGEST_TOKEN}`
-  if (!INGEST_TOKEN || got.length !== want.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) {
+  if (got.length !== want.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) {
     return c.json({ error: 'unauthorized' }, 401)
   }
   await next()
@@ -116,15 +137,15 @@ app.use('/ingest/*', async (c, next) => {
 app.post('/ingest/raw', async (c) => {
   const payload = await c.req.json().catch(() => ({}))
   const postedAt = Number(payload.postedAt) || Date.now()
-  const rows = [
-    ...parseNotifications(payload.notifications, postedAt),
-    ...parseSms(payload.sms, postedAt),
-  ]
-  const inserted = insertRows(rows)
-  return c.json({ received: rows.length, inserted, skipped: rows.length - inserted })
+  const rows = [...parseNotifications(payload.notifications, postedAt), ...parseSms(payload.sms, postedAt)]
+  try {
+    const inserted = await insertRows(rows)
+    return c.json({ received: rows.length, inserted, skipped: rows.length - inserted })
+  } catch (e) {
+    return c.json({ error: String(e.message || e) }, 502)
+  }
 })
 
-// Everything else: Basic auth (web feed + JSON API)
 app.use('*', async (c, next) => {
   if (!FEED_PASS) return next()
   const expected = 'Basic ' + Buffer.from(`${FEED_USER}:${FEED_PASS}`).toString('base64')
@@ -135,27 +156,34 @@ app.use('*', async (c, next) => {
   await next()
 })
 
-app.get('/messages', (c) => {
+app.get('/messages', async (c) => {
   const limit = Math.min(Number(c.req.query('limit') || 100), 500)
   const offset = Number(c.req.query('offset') || 0)
-  const conditions = []
-  const params = {}
-  if (c.req.query('app')) { conditions.push('app = @app'); params.app = c.req.query('app') }
-  if (c.req.query('source')) { conditions.push('source = @source'); params.source = c.req.query('source') }
-  if (c.req.query('q')) {
-    conditions.push('(title like @q or body like @q or sender like @q or app like @q)')
-    params.q = `%${c.req.query('q')}%`
+  const q = (c.req.query('q') || '').toLowerCase()
+  const appF = c.req.query('app') || ''
+  const sourceF = c.req.query('source') || ''
+  try {
+    const { items, total } = await fetchRecent(q ? 2000 : 500)
+    let filtered = items
+    if (appF) filtered = filtered.filter((m) => m.app === appF)
+    if (sourceF) filtered = filtered.filter((m) => m.source === sourceF)
+    if (q) filtered = filtered.filter((m) => `${m.title} ${m.body} ${m.sender} ${m.app}`.toLowerCase().includes(q))
+    const page = filtered.slice(offset, offset + limit)
+    return c.json({ total: q || appF || sourceF ? filtered.length : total, items: page })
+  } catch (e) {
+    return c.json({ error: String(e.message || e) }, 502)
   }
-  const where = conditions.length ? `where ${conditions.join(' and ')}` : ''
-  const items = db.prepare(`select * from messages ${where} order by id desc limit @limit offset @offset`)
-    .all({ ...params, limit, offset })
-  const { total } = db.prepare(`select count(*) as total from messages ${where}`).get(params)
-  return c.json({ total, items })
 })
 
-app.get('/apps', (c) => {
-  const items = db.prepare('select app, count(*) as n from messages group by app order by n desc').all()
-  return c.json({ items })
+app.get('/apps', async (c) => {
+  try {
+    const { items } = await fetchRecent(500)
+    const counts = {}
+    for (const m of items) counts[m.app] = (counts[m.app] || 0) + 1
+    return c.json({ items: Object.entries(counts).map(([app, n]) => ({ app, n })).sort((a, b) => b.n - a.n) })
+  } catch (e) {
+    return c.json({ error: String(e.message || e) }, 502)
+  }
 })
 
 const PAGE = `<!doctype html><html><head><meta charset=utf-8>
@@ -171,7 +199,7 @@ button{background:#2b6cb0;color:#fff;border:0;border-radius:8px;padding:8px 14px
 .chip{background:#1a2029;border:1px solid #2c3542;border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer;color:#9fb0c3}
 .chip.on{background:#2b6cb0;color:#fff;border-color:#2b6cb0}
 .msg{border:1px solid #232c38;border-radius:10px;padding:10px 12px;margin-bottom:8px;background:#141a22}
-.meta{font-size:11.5px;color:#8296ab;display:flex;gap:8px;margin-bottom:4px}
+.meta{font-size:11.5px;color:#8296ab;display:flex;gap:8px;margin-bottom:4px;flex-wrap:wrap}
 .src{padding:0 6px;border-radius:4px;background:#233043;font-weight:600}
 .src.sms{background:#3a2d51}
 .t{font-weight:600;margin-right:auto}
@@ -191,13 +219,13 @@ async function load(){
   if(q)u.searchParams.set('q',q); if(app)u.searchParams.set('app',app)
   const r=await fetch(u), d=await r.json()
   document.getElementById('count').textContent=d.total+' messages'
-  document.getElementById('list').innerHTML=d.items.map(m=>
+  document.getElementById('list').innerHTML=(d.items||[]).map(m=>
     '<div class=msg><div class=meta><span class="src '+m.source+'">'+esc(m.source)+'</span><span class=t>'+esc(m.title)+'</span><span>'+esc(m.app)+'</span><span>'+esc(m.msg_time)+'</span></div><div class=b>'+esc(m.body)+'</div></div>').join('')
 }
 async function chips(){
   const r=await fetch('/apps'), d=await r.json()
   document.getElementById('chips').innerHTML='<span class="chip'+(app?'':' on')+'" onclick="pick(\'\')">all</span>'+
-    d.items.map(x=>'<span class="chip'+(app===x.app?' on':'')+'" onclick="pick(\''+esc(x.app)+'\')">'+esc(x.app)+' ('+x.n+')</span>').join('')
+    (d.items||[]).map(x=>'<span class="chip'+(app===x.app?' on':'')+'" onclick="pick(\''+esc(x.app)+'\')">'+esc(x.app)+' ('+x.n+')</span>').join('')
 }
 function pick(a){app=a||null;chips();load()}
 function go(e){e.preventDefault();load();return false}
@@ -207,5 +235,5 @@ chips();load();setInterval(load,60000)
 app.get('/', (c) => c.html(PAGE))
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
-  console.log(`messages-hub listening on :${info.port} (db: ${DB_PATH})`)
+  console.log(`messages-hub on :${info.port} → ${SB_URL} (encrypted at rest)`)
 })

@@ -152,8 +152,7 @@ app.post('/ingest/raw', async (c) => {
 
 // Auth: Basic header, session cookie, or login link /?key=<password>.
 // On any Basic-auth success we ALSO plant the session cookie — some browsers
-// (Samsung Internet, in-app webviews) don't attach Basic auth to fetch() calls,
-// which broke the feed's background data loads.
+// (Samsung Internet, in-app webviews) don't attach Basic auth to fetch() calls.
 const COOKIE_VAL = FEED_PASS ? crypto.createHash('sha256').update(`mh:${FEED_USER}:${FEED_PASS}`).digest('hex') : ''
 const SET_COOKIE = `mh_auth=${COOKIE_VAL}; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax`
 
@@ -209,6 +208,10 @@ app.get('/apps', async (c) => {
   }
 })
 
+// NOTE: browser JS below must contain NO backslash-escaped quotes — this whole
+// page lives inside a JS template literal, and Node consumes `\'` before the
+// browser ever sees it (that bug shipped a page whose script never parsed).
+// Chips use data-app attributes + event delegation instead of inline onclick.
 const PAGE = `<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>messages</title><style>
@@ -230,11 +233,11 @@ button{background:#2b6cb0;color:#fff;border:0;border-radius:8px;padding:8px 14px
 #count{color:#8296ab;font-size:12.5px;margin:0 0 10px}
 </style></head><body>
 <h1>messages</h1>
-<form onsubmit="return go(event)"><input id=q placeholder="search…"><button>Search</button></form>
+<form id=f><input id=q placeholder="search…"><button>Search</button></form>
 <div class=chips id=chips></div>
 <p id=count></p><div id=list></div>
 <script>
-console.log('boot: fetch=' + (typeof fetch) + ' url=' + (typeof URL))
+console.log('boot: fetch=' + (typeof fetch))
 let app=null
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
 async function load(){
@@ -242,12 +245,12 @@ async function load(){
     const q=document.getElementById('q').value
     const u=new URL('/messages',location);u.searchParams.set('limit','200')
     if(q)u.searchParams.set('q',q); if(app)u.searchParams.set('app',app)
-    console.log('load: fetching ' + u.pathname + u.search)
+    console.log('load: fetching '+u.pathname)
     const r=await fetch(u,{credentials:'same-origin'})
-    console.log('load: status ' + r.status)
+    console.log('load: status '+r.status)
     if(r.status===401){document.getElementById('list').innerHTML='<div class=msg>Session expired — reopen your login link.</div>';return}
     const d=await r.json()
-    console.log('load: total ' + (d.total??'?'))
+    console.log('load: total '+(d.total??'?'))
     document.getElementById('count').textContent=(d.total??0)+' messages'
     document.getElementById('list').innerHTML=(d.items||[]).map(m=>
       '<div class=msg><div class=meta><span class="src '+m.source+'">'+esc(m.source)+'</span><span class=t>'+esc(m.title)+'</span><span>'+esc(m.app)+'</span><span>'+esc(m.msg_time)+'</span></div><div class=b>'+esc(m.body)+'</div></div>').join('')
@@ -256,14 +259,19 @@ async function load(){
 async function chips(){
   try{
     const r=await fetch('/apps',{credentials:'same-origin'})
-    if(!r.ok){console.log('chips: status '+r.ok);return}
+    if(!r.ok){console.log('chips: status '+r.status);return}
     const d=await r.json()
-    document.getElementById('chips').innerHTML='<span class="chip'+(app?'':' on')+'" onclick="pick(\'\')">all</span>'+
-      (d.items||[]).map(x=>'<span class="chip'+(app===x.app?' on':'')+'" onclick="pick(\''+esc(x.app)+'\')">'+esc(x.app)+' ('+x.n+')</span>').join('')
+    document.getElementById('chips').innerHTML=
+      '<span class="chip'+(app?'':' on')+'" data-app="">all</span>'+
+      (d.items||[]).map(x=>'<span class="chip'+(app===x.app?' on':'')+'" data-app="'+esc(x.app)+'">'+esc(x.app)+' ('+x.n+')</span>').join('')
   }catch(e){console.error('chips failed: '+(e&&e.message?e.message:e))}
 }
 function pick(a){app=a||null;chips();load()}
-function go(e){e.preventDefault();load();return false}
+document.getElementById('chips').addEventListener('click',function(e){
+  var t=e.target&&e.target.closest?e.target.closest('.chip'):null
+  if(t)pick(t.getAttribute('data-app')||'')
+})
+document.getElementById('f').addEventListener('submit',function(e){e.preventDefault();load()})
 chips();load();setInterval(load,60000)
 </script></body></html>`
 

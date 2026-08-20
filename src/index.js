@@ -176,6 +176,9 @@ app.use('*', async (c, next) => {
   return c.body('Unauthorized — open your login link: messages.asikmydeen.com/?key=<feed password>', 401, { 'WWW-Authenticate': 'Basic realm="messages"' })
 })
 
+// Never let browsers cache stale page JS — every load gets fresh code.
+app.use('*', async (c, next) => { await next(); c.res.headers.set('Cache-Control', 'no-store') })
+
 app.get('/messages', async (c) => {
   const limit = Math.min(Number(c.req.query('limit') || 100), 500)
   const offset = Number(c.req.query('offset') || 0)

@@ -8,6 +8,8 @@ const FEED_USER = process.env.FEED_USER || 'asik'
 const FEED_PASS = process.env.FEED_PASS || ''
 const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '')
 const SB_KEY = process.env.SUPABASE_ANON_KEY || ''
+const QDRANT_URL = (process.env.QDRANT_URL || '').replace(/\/$/, '')
+const OLLAMA_URL = (process.env.OLLAMA_URL || '').replace(/\/$/, '')
 
 if (!INGEST_TOKEN || !SB_URL || !SB_KEY) {
   console.error('missing env: INGEST_TOKEN / SUPABASE_URL / SUPABASE_ANON_KEY')
@@ -32,6 +34,10 @@ const dec = (b) => {
 }
 
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 40)
+const uuidFromKey = (k) => {
+  const h = String(k).replace(/[^0-9a-f]/g, '').padEnd(32, '0').slice(0, 32)
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}
 
 const DENY_APPS = new Set([
   'com.termux', 'com.termux.api', 'com.termux.boot', 'com.termux.widget',
@@ -96,19 +102,19 @@ async function pgr(path, opts = {}) {
 }
 
 async function insertRows(rows) {
-  if (!rows.length) return 0
+  if (!rows.length) return []
   const payload = rows.map((r) => ({
     dedup_key: r.dedup_key, source: r.source,
     app_enc: enc(r.app), title_enc: enc(r.title), sender_enc: enc(r.sender), body_enc: enc(r.body),
     msg_time: r.msg_time, posted_at: r.posted_at,
   }))
-  const r = await pgr('messages?on_conflict=dedup_key&select=id', {
+  const r = await pgr('messages?on_conflict=dedup_key&select=id,dedup_key', {
     method: 'POST',
     headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
     body: JSON.stringify(payload),
   })
   const inserted = await r.json()
-  return Array.isArray(inserted) ? inserted.length : 0
+  return Array.isArray(inserted) ? inserted.map((x) => x.dedup_key) : []
 }
 
 async function fetchRecent(limit = 500) {
@@ -118,11 +124,43 @@ async function fetchRecent(limit = 500) {
   const range = r.headers.get('content-range') || '' // e.g. "0-499/1234"
   const total = range.includes('/') ? Number(range.split('/')[1]) : null
   const items = (await r.json()).map((m) => ({
-    id: m.id, source: m.source,
+    id: m.id, dedup_key: m.dedup_key, source: m.source,
     app: dec(m.app_enc), title: dec(m.title_enc), sender: dec(m.sender_enc), body: dec(m.body_enc),
     msg_time: m.msg_time, posted_at: m.posted_at, ingested_at: m.ingested_at,
   }))
   return { items, total }
+}
+
+// Brain sync: embed messages via Ollama (LAN) and upsert into Qdrant `messages`.
+// Deterministic point IDs (from dedup_key) make it idempotent. Fire-and-forget
+// at ingest; failures never break capture.
+async function embedAndStore(rows) {
+  if (!QDRANT_URL || !OLLAMA_URL || !rows.length) return 0
+  try {
+    const texts = rows.map((r) => `${r.title ? r.title + '\n' : ''}${r.body}`)
+    const er = await fetch(`${OLLAMA_URL}/api/embed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'nomic-embed-text', input: texts }),
+    })
+    if (!er.ok) throw new Error(`ollama ${er.status}: ${(await er.text()).slice(0, 120)}`)
+    const { embeddings } = await er.json()
+    const points = rows.map((r, i) => ({
+      id: uuidFromKey(r.dedup_key),
+      vector: embeddings[i],
+      payload: { text: texts[i], source: r.source, app: r.app, msg_time: r.msg_time, type: 'message' },
+    }))
+    const qr = await fetch(`${QDRANT_URL}/collections/messages/points?wait=true`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ points }),
+    })
+    if (!qr.ok) throw new Error(`qdrant ${qr.status}: ${(await qr.text()).slice(0, 120)}`)
+    return points.length
+  } catch (e) {
+    console.error('brain sync failed:', e.message)
+    return 0
+  }
 }
 
 const app = new Hono()
@@ -143,8 +181,23 @@ app.post('/ingest/raw', async (c) => {
   const postedAt = Number(payload.postedAt) || Date.now()
   const rows = [...parseNotifications(payload.notifications, postedAt), ...parseSms(payload.sms, postedAt)]
   try {
-    const inserted = await insertRows(rows)
-    return c.json({ received: rows.length, inserted, skipped: rows.length - inserted })
+    const insertedKeys = await insertRows(rows)
+    if (insertedKeys.length) {
+      const newRows = rows.filter((r) => insertedKeys.includes(r.dedup_key))
+      embedAndStore(newRows).catch(() => {}) // fire-and-forget brain sync
+    }
+    return c.json({ received: rows.length, inserted: insertedKeys.length, skipped: rows.length - insertedKeys.length })
+  } catch (e) {
+    return c.json({ error: String(e.message || e) }, 502)
+  }
+})
+
+// One-shot, idempotent: embed the last 500 stored messages into the brain.
+app.post('/ingest/backfill', async (c) => {
+  try {
+    const { items } = await fetchRecent(500)
+    const embedded = await embedAndStore(items)
+    return c.json({ stored: items.length, embedded })
   } catch (e) {
     return c.json({ error: String(e.message || e) }, 502)
   }
@@ -209,9 +262,8 @@ app.get('/apps', async (c) => {
 })
 
 // NOTE: browser JS below must contain NO backslash-escaped quotes — this whole
-// page lives inside a JS template literal, and Node consumes `\'` before the
-// browser ever sees it (that bug shipped a page whose script never parsed).
-// Chips use data-app attributes + event delegation instead of inline onclick.
+// page lives inside a JS template literal, and Node consumes \' before the
+// browser ever sees it. Chips use data-app attributes + event delegation.
 const PAGE = `<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>messages</title><style>
@@ -278,5 +330,5 @@ chips();load();setInterval(load,60000)
 app.get('/', (c) => c.html(PAGE))
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
-  console.log(`messages-hub on :${info.port} → ${SB_URL} (encrypted at rest)`)
+  console.log(`messages-hub on :${info.port} → ${SB_URL}${QDRANT_URL ? ' + brain(' + QDRANT_URL + ')' : ''} (encrypted at rest)`)
 })

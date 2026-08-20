@@ -1,0 +1,4 @@
+name: messages
+type: api
+deploy:
+  - target: dokploy

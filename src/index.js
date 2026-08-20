@@ -150,14 +150,23 @@ app.post('/ingest/raw', async (c) => {
   }
 })
 
+// Auth: Basic header, session cookie, or one-time login link /?key=<password>
+const COOKIE_VAL = FEED_PASS ? crypto.createHash('sha256').update(`mh:${FEED_USER}:${FEED_PASS}`).digest('hex') : ''
+
 app.use('*', async (c, next) => {
   if (!FEED_PASS) return next()
   const expected = 'Basic ' + Buffer.from(`${FEED_USER}:${FEED_PASS}`).toString('base64')
   const got = c.req.header('Authorization') || ''
-  if (got.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected))) {
-    return c.body('Unauthorized', 401, { 'WWW-Authenticate': 'Basic realm="messages"' })
+  const basicOk = got.length === expected.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected))
+  const cookie = c.req.header('Cookie') || ''
+  const cookieOk = cookie.includes(`mh_auth=${COOKIE_VAL}`)
+  if (basicOk || cookieOk) return next()
+  const key = c.req.query('key') || ''
+  if (key && (key === FEED_PASS || key === `${FEED_USER}:${FEED_PASS}`)) {
+    c.header('Set-Cookie', `mh_auth=${COOKIE_VAL}; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax`)
+    return next()
   }
-  await next()
+  return c.body('Unauthorized — open your login link: messages.asikmydeen.com/?key=<feed password>', 401, { 'WWW-Authenticate': 'Basic realm="messages"' })
 })
 
 app.get('/messages', async (c) => {
@@ -221,13 +230,17 @@ async function load(){
   const q=document.getElementById('q').value
   const u=new URL('/messages',location);u.searchParams.set('limit','200')
   if(q)u.searchParams.set('q',q); if(app)u.searchParams.set('app',app)
-  const r=await fetch(u), d=await r.json()
-  document.getElementById('count').textContent=d.total+' messages'
+  const r=await fetch(u)
+  if(r.status===401){document.getElementById('list').innerHTML='<div class=msg>Session expired — reopen your login link.</div>';return}
+  const d=await r.json()
+  document.getElementById('count').textContent=(d.total??0)+' messages'
   document.getElementById('list').innerHTML=(d.items||[]).map(m=>
     '<div class=msg><div class=meta><span class="src '+m.source+'">'+esc(m.source)+'</span><span class=t>'+esc(m.title)+'</span><span>'+esc(m.app)+'</span><span>'+esc(m.msg_time)+'</span></div><div class=b>'+esc(m.body)+'</div></div>').join('')
 }
 async function chips(){
-  const r=await fetch('/apps'), d=await r.json()
+  const r=await fetch('/apps')
+  if(!r.ok)return
+  const d=await r.json()
   document.getElementById('chips').innerHTML='<span class="chip'+(app?'':' on')+'" onclick="pick(\'\')">all</span>'+
     (d.items||[]).map(x=>'<span class="chip'+(app===x.app?' on':'')+'" onclick="pick(\''+esc(x.app)+'\')">'+esc(x.app)+' ('+x.n+')</span>').join('')
 }

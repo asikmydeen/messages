@@ -11,8 +11,8 @@ const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '')
 const SB_KEY = process.env.SUPABASE_ANON_KEY || ''
 const QDRANT_URL = (process.env.QDRANT_URL || '').replace(/\/$/, '')
 const OLLAMA_URL = (process.env.OLLAMA_URL || '').replace(/\/$/, '')
-const GMAIL_USER = process.env.GMAIL_USER || ''
-const GMAIL_PASS = process.env.GMAIL_APP_PASSWORD || ''
+let GMAIL_ACCOUNTS = []
+try { GMAIL_ACCOUNTS = JSON.parse(process.env.GMAIL_ACCOUNTS || '[]') } catch { GMAIL_ACCOUNTS = [] }
 
 if (!INGEST_TOKEN || !SB_URL || !SB_KEY) {
   console.error('missing env: INGEST_TOKEN / SUPABASE_URL / SUPABASE_ANON_KEY')
@@ -46,6 +46,14 @@ const DENY_APPS = new Set([
   'com.termux', 'com.termux.api', 'com.termux.boot', 'com.termux.widget',
   'com.android.systemui', 'android',
 ])
+
+// Secrets that must never be captured into the feed/brain (app passwords,
+// tokens). Any message containing one is silently dropped at ingest.
+const SECRETS = [INGEST_TOKEN, FEED_PASS, ...GMAIL_ACCOUNTS.map((a) => a.pass)].filter((s) => s && s.length >= 8)
+const leaksSecret = (r) => {
+  const hay = `${r.title || ''}\n${r.body || ''}\n${r.sender || ''}`
+  return SECRETS.some((s) => hay.includes(s))
+}
 
 function parseNotifications(list, postedAt) {
   const rows = []
@@ -166,8 +174,11 @@ async function embedAndStore(rows) {
   }
 }
 
-// ---- Gmail sync (daily + backfill) ----
-const gmailStatus = { running: false, lastRun: null, lastOk: null, fetched: 0, inserted: 0, embedded: 0, error: null }
+// ---- Gmail sync (multi-account, daily + 6-month backfill) ----
+const gmailStatus = {
+  running: false, lastRun: null,
+  accounts: {}, // email -> {running, fetched, inserted, embedded, lastOk, error}
+}
 
 async function getSyncState(key) {
   const r = await pgr(`sync_state?select=value&key=eq.${key}`)
@@ -183,47 +194,54 @@ async function setSyncState(key, value) {
   })
 }
 
-async function runGmailSync(reason) {
-  if (!GMAIL_USER || !GMAIL_PASS) { gmailStatus.error = 'no gmail credentials configured'; return }
-  if (gmailStatus.running) return
-  gmailStatus.running = true
-  gmailStatus.error = null
-  gmailStatus.fetched = gmailStatus.inserted = gmailStatus.embedded = 0
-  const startedAt = new Date().toISOString()
+async function syncOneAccount(acct, reason) {
+  const st = { running: true, fetched: 0, inserted: 0, embedded: 0, error: null, lastOk: null }
+  gmailStatus.accounts[acct.user] = st
   try {
-    const last = await getSyncState('gmail_last_date')
+    const last = await getSyncState(`gmail_last_date:${acct.user}`)
     // first run = 6-month backfill; afterwards daily increment (1-day overlap, dedup makes it safe)
     const since = last ? new Date(Number(last) - 86400000) : new Date(Date.now() - 182 * 86400000)
     const rows = await fetchGmail({
-      user: GMAIL_USER, pass: GMAIL_PASS, since,
-      onProgress: (done, total) => { gmailStatus.fetched = done; gmailStatus.total = total },
+      user: acct.user, pass: acct.pass, since,
+      onProgress: (done) => { st.fetched = done },
     })
-    gmailStatus.fetched = rows.length
+    st.fetched = rows.length
     const insertedKeys = await insertRows(rows)
-    gmailStatus.inserted = insertedKeys.length
-    let embedded = 0
+    st.inserted = insertedKeys.length
     if (insertedKeys.length) {
       const newRows = rows.filter((r) => insertedKeys.includes(r.dedup_key))
       for (let i = 0; i < newRows.length; i += 32) {
-        embedded += await embedAndStore(newRows.slice(i, i + 32))
+        st.embedded += await embedAndStore(newRows.slice(i, i + 32))
       }
     }
-    gmailStatus.embedded = embedded
-    await setSyncState('gmail_last_date', Date.now())
-    gmailStatus.lastOk = new Date().toISOString()
-    console.log(`gmail sync (${reason}): fetched=${rows.length} inserted=${insertedKeys.length} embedded=${embedded}`)
+    await setSyncState(`gmail_last_date:${acct.user}`, Date.now())
+    st.lastOk = new Date().toISOString()
+    console.log(`gmail sync ${acct.user} (${reason}): fetched=${rows.length} inserted=${st.inserted} embedded=${st.embedded}`)
   } catch (e) {
-    gmailStatus.error = String(e.message || e)
-    console.error('gmail sync failed:', gmailStatus.error)
+    st.error = String(e.message || e)
+    console.error(`gmail sync ${acct.user} failed:`, st.error)
   } finally {
-    gmailStatus.lastRun = startedAt
+    st.running = false
+  }
+}
+
+async function runGmailSync(reason) {
+  if (!GMAIL_ACCOUNTS.length) return
+  if (gmailStatus.running) return
+  gmailStatus.running = true
+  gmailStatus.lastRun = new Date().toISOString()
+  try {
+    for (const acct of GMAIL_ACCOUNTS) {
+      await syncOneAccount(acct, reason)
+    }
+  } finally {
     gmailStatus.running = false
   }
 }
 
 const app = new Hono()
 
-app.get('/health', (c) => c.json({ ok: true, gmail: GMAIL_USER ? { running: gmailStatus.running, lastOk: gmailStatus.lastOk } : null }))
+app.get('/health', (c) => c.json({ ok: true, gmailAccounts: GMAIL_ACCOUNTS.length }))
 
 app.use('/ingest/*', async (c, next) => {
   const got = c.req.header('Authorization') || ''
@@ -237,14 +255,16 @@ app.use('/ingest/*', async (c, next) => {
 app.post('/ingest/raw', async (c) => {
   const payload = await c.req.json().catch(() => ({}))
   const postedAt = Number(payload.postedAt) || Date.now()
-  const rows = [...parseNotifications(payload.notifications, postedAt), ...parseSms(payload.sms, postedAt)]
+  let rows = [...parseNotifications(payload.notifications, postedAt), ...parseSms(payload.sms, postedAt)]
+  const before = rows.length
+  rows = rows.filter((r) => !leaksSecret(r)) // never capture configured secrets
   try {
     const insertedKeys = await insertRows(rows)
     if (insertedKeys.length) {
       const newRows = rows.filter((r) => insertedKeys.includes(r.dedup_key))
       embedAndStore(newRows).catch(() => {}) // fire-and-forget brain sync
     }
-    return c.json({ received: rows.length, inserted: insertedKeys.length, skipped: rows.length - insertedKeys.length })
+    return c.json({ received: rows.length, inserted: insertedKeys.length, skipped: rows.length - insertedKeys.length, scrubbed: before - rows.length })
   } catch (e) {
     return c.json({ error: String(e.message || e) }, 502)
   }
@@ -263,10 +283,10 @@ app.post('/ingest/backfill', async (c) => {
 
 // Gmail: trigger a sync now (async — poll /ingest/gmail-status).
 app.post('/ingest/gmail-sync', (c) => {
-  if (!GMAIL_USER || !GMAIL_PASS) return c.json({ error: 'gmail not configured (GMAIL_USER / GMAIL_APP_PASSWORD env)' }, 400)
+  if (!GMAIL_ACCOUNTS.length) return c.json({ error: 'gmail not configured (GMAIL_ACCOUNTS env)' }, 400)
   if (gmailStatus.running) return c.json({ ...gmailStatus, note: 'already running' })
   runGmailSync('manual').catch(() => {})
-  return c.json({ started: true })
+  return c.json({ started: true, accounts: GMAIL_ACCOUNTS.map((a) => a.user) })
 })
 
 app.get('/ingest/gmail-status', (c) => c.json(gmailStatus))
@@ -399,8 +419,8 @@ chips();load();setInterval(load,60000)
 app.get('/', (c) => c.html(PAGE))
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
-  console.log(`messages-hub on :${info.port} → ${SB_URL}${QDRANT_URL ? ' + brain' : ''}${GMAIL_USER ? ' + gmail(' + GMAIL_USER + ')' : ''}`)
-  if (GMAIL_USER && GMAIL_PASS) {
+  console.log(`messages-hub on :${info.port} → ${SB_URL}${QDRANT_URL ? ' + brain' : ''} + ${GMAIL_ACCOUNTS.length} gmail account(s)`)
+  if (GMAIL_ACCOUNTS.length) {
     setTimeout(() => runGmailSync('boot').catch(() => {}), 15000)
     setInterval(() => runGmailSync('daily').catch(() => {}), 24 * 3600 * 1000)
   }

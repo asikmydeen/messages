@@ -231,25 +231,33 @@ button{background:#2b6cb0;color:#fff;border:0;border-radius:8px;padding:8px 14px
 <div class=chips id=chips></div>
 <p id=count></p><div id=list></div>
 <script>
+console.log('boot: fetch=' + (typeof fetch) + ' url=' + (typeof URL))
 let app=null
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
 async function load(){
-  const q=document.getElementById('q').value
-  const u=new URL('/messages',location);u.searchParams.set('limit','200')
-  if(q)u.searchParams.set('q',q); if(app)u.searchParams.set('app',app)
-  const r=await fetch(u,{credentials:'same-origin'})
-  if(r.status===401){document.getElementById('list').innerHTML='<div class=msg>Session expired — reopen your login link.</div>';return}
-  const d=await r.json()
-  document.getElementById('count').textContent=(d.total??0)+' messages'
-  document.getElementById('list').innerHTML=(d.items||[]).map(m=>
-    '<div class=msg><div class=meta><span class="src '+m.source+'">'+esc(m.source)+'</span><span class=t>'+esc(m.title)+'</span><span>'+esc(m.app)+'</span><span>'+esc(m.msg_time)+'</span></div><div class=b>'+esc(m.body)+'</div></div>').join('')
+  try{
+    const q=document.getElementById('q').value
+    const u=new URL('/messages',location);u.searchParams.set('limit','200')
+    if(q)u.searchParams.set('q',q); if(app)u.searchParams.set('app',app)
+    console.log('load: fetching ' + u.pathname + u.search)
+    const r=await fetch(u,{credentials:'same-origin'})
+    console.log('load: status ' + r.status)
+    if(r.status===401){document.getElementById('list').innerHTML='<div class=msg>Session expired — reopen your login link.</div>';return}
+    const d=await r.json()
+    console.log('load: total ' + (d.total??'?'))
+    document.getElementById('count').textContent=(d.total??0)+' messages'
+    document.getElementById('list').innerHTML=(d.items||[]).map(m=>
+      '<div class=msg><div class=meta><span class="src '+m.source+'">'+esc(m.source)+'</span><span class=t>'+esc(m.title)+'</span><span>'+esc(m.app)+'</span><span>'+esc(m.msg_time)+'</span></div><div class=b>'+esc(m.body)+'</div></div>').join('')
+  }catch(e){console.error('load failed: '+(e&&e.message?e.message:e));document.getElementById('list').innerHTML='<div class=msg>Error loading: '+esc(e&&e.message?e.message:e)+'</div>'}
 }
 async function chips(){
-  const r=await fetch('/apps',{credentials:'same-origin'})
-  if(!r.ok)return
-  const d=await r.json()
-  document.getElementById('chips').innerHTML='<span class="chip'+(app?'':' on')+'" onclick="pick(\'\')">all</span>'+
-    (d.items||[]).map(x=>'<span class="chip'+(app===x.app?' on':'')+'" onclick="pick(\''+esc(x.app)+'\')">'+esc(x.app)+' ('+x.n+')</span>').join('')
+  try{
+    const r=await fetch('/apps',{credentials:'same-origin'})
+    if(!r.ok){console.log('chips: status '+r.ok);return}
+    const d=await r.json()
+    document.getElementById('chips').innerHTML='<span class="chip'+(app?'':' on')+'" onclick="pick(\'\')">all</span>'+
+      (d.items||[]).map(x=>'<span class="chip'+(app===x.app?' on':'')+'" onclick="pick(\''+esc(x.app)+'\')">'+esc(x.app)+' ('+x.n+')</span>').join('')
+  }catch(e){console.error('chips failed: '+(e&&e.message?e.message:e))}
 }
 function pick(a){app=a||null;chips();load()}
 function go(e){e.preventDefault();load();return false}

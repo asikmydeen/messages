@@ -345,6 +345,40 @@ app.get('/messages', async (c) => {
   }
 })
 
+// Full-corpus keyword search via Qdrant full-text index (payload.text) —
+// covers ALL messages instantly, unlike /messages' recent-window filter.
+app.get('/search', async (c) => {
+  const q = (c.req.query('q') || '').trim().toLowerCase()
+  const appF = c.req.query('app') || ''
+  const limit = Math.min(Number(c.req.query('limit') || 100), 300)
+  if (!q) return c.json({ total: 0, items: [] })
+  if (!QDRANT_URL) return c.json({ error: 'search unavailable (QDRANT_URL not set)' }, 501)
+  try {
+    const must = [{ key: 'text', match: { text: q } }]
+    if (appF) must.push({ key: 'app', match: { keyword: appF } })
+    const r = await fetch(`${QDRANT_URL}/collections/messages/points/scroll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filter: { must }, limit, with_payload: true, order_by: { key: 'msg_time', direction: 'desc' } }),
+    })
+    if (!r.ok) throw new Error(`qdrant ${r.status}: ${(await r.text()).slice(0, 120)}`)
+    const d = await r.json()
+    const items = ((d.result && d.result.points) || []).map((p) => {
+      const pl = p.payload || {}
+      const text = String(pl.text || '')
+      const nl = text.indexOf('\n')
+      return {
+        id: p.id, source: pl.source, app: pl.app,
+        title: (nl > 0 ? text.slice(0, nl) : text).slice(0, 200),
+        sender: '', body: text, msg_time: pl.msg_time,
+      }
+    })
+    return c.json({ total: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e.message || e) }, 502)
+  }
+})
+
 app.get('/apps', async (c) => {
   try {
     const { items } = await fetchRecent(500)
@@ -381,7 +415,7 @@ button{background:#2b6cb0;color:#fff;border:0;border-radius:8px;padding:8px 14px
 #count{color:#8296ab;font-size:12.5px;margin:0 0 10px}
 </style></head><body>
 <h1>messages</h1>
-<form id=f><input id=q placeholder="search…"><button>Search</button></form>
+<form id=f><input id=q placeholder="search all…"><button>Search</button></form>
 <div class=chips id=chips></div>
 <p id=count></p><div id=list></div>
 <script>
@@ -390,9 +424,10 @@ let app=null
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
 async function load(){
   try{
-    const q=document.getElementById('q').value
-    const u=new URL('/messages',location);u.searchParams.set('limit','200')
-    if(q)u.searchParams.set('q',q); if(app)u.searchParams.set('app',app)
+    const q=document.getElementById('q').value.trim()
+    let u
+    if(q){ u=new URL('/search',location); u.searchParams.set('q',q); u.searchParams.set('limit','200'); if(app)u.searchParams.set('app',app) }
+    else{ u=new URL('/messages',location); u.searchParams.set('limit','200'); if(app)u.searchParams.set('app',app) }
     console.log('load: fetching '+u.pathname)
     const r=await fetch(u,{credentials:'same-origin'})
     console.log('load: status '+r.status)

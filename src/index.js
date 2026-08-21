@@ -112,20 +112,27 @@ async function pgr(path, opts = {}) {
   return r
 }
 
+// Chunked insert: Cloudflare tunnel rejects bodies >100MB — a 27k-row gmail
+// backfill was ~108MB in one POST and got 413'd. 400 rows ≈ 2MB per request.
 async function insertRows(rows) {
   if (!rows.length) return []
-  const payload = rows.map((r) => ({
-    dedup_key: r.dedup_key, source: r.source,
-    app_enc: enc(r.app), title_enc: enc(r.title), sender_enc: enc(r.sender), body_enc: enc(r.body),
-    msg_time: r.msg_time, posted_at: r.posted_at,
-  }))
-  const r = await pgr('messages?on_conflict=dedup_key&select=id,dedup_key', {
-    method: 'POST',
-    headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
-    body: JSON.stringify(payload),
-  })
-  const inserted = await r.json()
-  return Array.isArray(inserted) ? inserted.map((x) => x.dedup_key) : []
+  const insertedKeys = []
+  for (let i = 0; i < rows.length; i += 400) {
+    const chunk = rows.slice(i, i + 400)
+    const payload = chunk.map((r) => ({
+      dedup_key: r.dedup_key, source: r.source,
+      app_enc: enc(r.app), title_enc: enc(r.title), sender_enc: enc(r.sender), body_enc: enc(r.body),
+      msg_time: r.msg_time, posted_at: r.posted_at,
+    }))
+    const r = await pgr('messages?on_conflict=dedup_key&select=dedup_key', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
+      body: JSON.stringify(payload),
+    })
+    const inserted = await r.json()
+    if (Array.isArray(inserted)) insertedKeys.push(...inserted.map((x) => x.dedup_key))
+  }
+  return insertedKeys
 }
 
 async function fetchRecent(limit = 500) {
@@ -177,7 +184,7 @@ async function embedAndStore(rows) {
 // ---- Gmail sync (multi-account, daily + 6-month backfill) ----
 const gmailStatus = {
   running: false, lastRun: null,
-  accounts: {}, // email -> {running, fetched, inserted, embedded, lastOk, error}
+  accounts: {}, // email -> {running, fetched, inserted, embedded, error, lastOk}
 }
 
 async function getSyncState(key) {

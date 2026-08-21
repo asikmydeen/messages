@@ -359,7 +359,7 @@ app.get('/search', async (c) => {
     const r = await fetch(`${QDRANT_URL}/collections/messages/points/scroll`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filter: { must }, limit, with_payload: true, order_by: { key: 'msg_time', direction: 'desc' } }),
+      body: JSON.stringify({ filter: { must }, limit, with_payload: true }),
     })
     if (!r.ok) throw new Error(`qdrant ${r.status}: ${(await r.text()).slice(0, 120)}`)
     const d = await r.json()

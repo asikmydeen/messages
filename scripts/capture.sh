@@ -31,6 +31,17 @@ N="$(json_or_empty "${N:-[]}")"
 S="$(json_or_empty "${S:-[]}")"
 C="$(json_or_empty "${C:-[]}")"
 
+# Fold calls into SMS-shaped rows so today's hub stores them even before
+# parseCalls is deployed. Hub dedup keeps this idempotent.
+PY=""
+[ -x /usr/bin/python3 ] && PY=/usr/bin/python3
+[ -z "$PY" ] && [ -x "$TB/python3" ] && PY="$TB/python3"
+if [ -n "$PY" ] && [ -f "$DIR/merge_calls.py" ]; then
+  printf '%s' "$C" > "$DIR/last.calls.json"
+  S=$(printf '%s' "$S" | "$PY" "$DIR/merge_calls.py" "$DIR/last.calls.json") || S="$S"
+  S="$(json_or_empty "${S:-[]}")"
+fi
+
 HASHBIN=""
 [ -x "$TB/sha256sum" ] && HASHBIN="$TB/sha256sum"
 [ -z "$HASHBIN" ] && command -v sha256sum >/dev/null 2>&1 && HASHBIN=sha256sum

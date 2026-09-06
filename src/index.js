@@ -98,7 +98,7 @@ function parseSms(list, postedAt) {
   return rows
 }
 
-// termux-call-log schema: name, phone_number, type, date ("YYYY-MM-DD HH:MM:SS"), duration, sim_id
+// call-log ingest 2026-09-06 — termux-call-log schema: name, phone_number, type, date ("YYYY-MM-DD HH:MM:SS"), duration, sim_id
 function parseCalls(list, postedAt) {
   const rows = []
   for (const c of Array.isArray(list) ? list : []) {

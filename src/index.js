@@ -98,6 +98,32 @@ function parseSms(list, postedAt) {
   return rows
 }
 
+// termux-call-log schema: name, phone_number, type, date ("YYYY-MM-DD HH:MM:SS"), duration, sim_id
+function parseCalls(list, postedAt) {
+  const rows = []
+  for (const c of Array.isArray(list) ? list : []) {
+    const num = String(c.phone_number || c.number || '').trim()
+    const name = String(c.name || '').trim()
+    const type = String(c.type || 'CALL').trim().toUpperCase()
+    const when = c.date || c.when || ''
+    const dur = c.duration || ''
+    if (!num && !name) continue
+    const who = name && name !== 'UNKNOWN_CALLER' ? name : (num || 'unknown')
+    const extra = num && who !== num ? ` ${num}` : ''
+    rows.push({
+      dedup_key: sha(`call|${num}|${type}|${when}|${dur}`),
+      source: 'call',
+      app: 'call-log',
+      title: `${type} ${who}`,
+      sender: num,
+      body: `${type} ${who}${extra} dur=${dur}`.trim(),
+      msg_time: when,
+      posted_at: postedAt,
+    })
+  }
+  return rows
+}
+
 async function pgr(path, opts = {}) {
   const r = await fetch(`${SB_URL}/rest/v1/${path}`, {
     ...opts,
@@ -262,7 +288,11 @@ app.use('/ingest/*', async (c, next) => {
 app.post('/ingest/raw', async (c) => {
   const payload = await c.req.json().catch(() => ({}))
   const postedAt = Number(payload.postedAt) || Date.now()
-  let rows = [...parseNotifications(payload.notifications, postedAt), ...parseSms(payload.sms, postedAt)]
+  let rows = [
+    ...parseNotifications(payload.notifications, postedAt),
+    ...parseSms(payload.sms, postedAt),
+    ...parseCalls(payload.calls, postedAt),
+  ]
   const before = rows.length
   rows = rows.filter((r) => !leaksSecret(r)) // never capture configured secrets
   try {
@@ -410,6 +440,7 @@ button{background:#2b6cb0;color:#fff;border:0;border-radius:8px;padding:8px 14px
 .src{padding:0 6px;border-radius:4px;background:#233043;font-weight:600}
 .src.sms{background:#3a2d51}
 .src.gmail{background:#1e3a5f}
+.src.call{background:#1e4d3a}
 .t{font-weight:600;margin-right:auto}
 .b{white-space:pre-wrap;word-break:break-word}
 #count{color:#8296ab;font-size:12.5px;margin:0 0 10px}

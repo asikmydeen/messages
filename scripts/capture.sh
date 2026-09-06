@@ -1,17 +1,55 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# Forward phone notifications + SMS to messages.asikmydeen.com
-# Runs in Termux (or PRoot on the same phone). Raw JSON is sent; the hub
-# does all filtering + dedup server-side. No jq/python needed here.
+# Forward notifications + SMS + call log to messages.asikmydeen.com.
+# Raw JSON; hub filters, dedups, encrypts, embeds into Qdrant `messages`.
 DIR="$(cd "$(dirname "$0")" && pwd)"
 TB=/data/data/com.termux/files/usr/bin
 HUB="https://messages.asikmydeen.com"
 TOKEN="$(cat "$DIR/token" 2>/dev/null)"
 [ -n "$TOKEN" ] || { echo "no token file" >&2; exit 1; }
 
-N="$($TB/termux-notification-list 2>/dev/null)"; N="${N:-[]}"
-S="$($TB/termux-sms-list 2>/dev/null)"; S="${S:-[]}"
+run() {
+  if [ -x /usr/bin/timeout ]; then
+    /usr/bin/timeout 20 "$@"
+  elif command -v timeout >/dev/null 2>&1; then
+    timeout 20 "$@"
+  else
+    "$@"
+  fi
+}
 
-curl -s -m 45 -X POST "$HUB/ingest/raw" \
+json_or_empty() {
+  case "$1" in
+    \[*) printf '%s' "$1" ;;
+    *) printf '%s' '[]' ;;
+  esac
+}
+
+N="$(run "$TB/termux-notification-list" 2>/dev/null)"
+S="$(run "$TB/termux-sms-list" --message-limit=50 2>/dev/null)"
+C="$(run "$TB/termux-call-log" -l 50 2>/dev/null)"
+N="$(json_or_empty "${N:-[]}")"
+S="$(json_or_empty "${S:-[]}")"
+C="$(json_or_empty "${C:-[]}")"
+
+HASHBIN=""
+[ -x "$TB/sha256sum" ] && HASHBIN="$TB/sha256sum"
+[ -z "$HASHBIN" ] && command -v sha256sum >/dev/null 2>&1 && HASHBIN=sha256sum
+H=""
+if [ -n "$HASHBIN" ]; then
+  H=$(printf '%s\n%s\n%s' "$N" "$S" "$C" | $HASHBIN | awk '{print $1}')
+fi
+if [ -n "$H" ] && [ -f "$DIR/last.hash" ] && [ "$H" = "$(cat "$DIR/last.hash")" ]; then
+  echo '{"skipped":"unchanged"}'
+  exit 0
+fi
+
+BODY="$DIR/last.body"
+printf '{"postedAt":%s,"notifications":%s,"sms":%s,"calls":%s}\n' "$(date +%s000)" "$N" "$S" "$C" > "$BODY"
+CURL="$TB/curl"
+[ -x "$CURL" ] || CURL=curl
+$CURL -s -m 45 -X POST "$HUB/ingest/raw" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"postedAt\":$(date +%s000),\"notifications\":${N},\"sms\":${S}}"
+  --data-binary @"$BODY"
+echo
+[ -n "$H" ] && echo "$H" > "$DIR/last.hash"

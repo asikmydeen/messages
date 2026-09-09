@@ -1,38 +1,12 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# messages-hub capture daemon — wake-locked loop.
-# Polls every 20s so new SMS / calls / shade items hit the hub quickly.
-# Content-URI jobs (install-jobs.sh) also fire capture.sh on SMS/call-log changes.
-B=/data/data/com.termux/files/usr/bin
-M=/data/data/com.termux/files/home/.messages
-L=$M/daemon.log
-PIDF=$M/daemon.pid
-
-if [ -f "$PIDF" ]; then
-  old=$(cat "$PIDF" 2>/dev/null)
-  if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-    exit 0
-  fi
-fi
-echo $$ > "$PIDF"
-
-$B/termux-wake-lock 2>/dev/null || true
-
-nap() {
-  sec=${1:-20}
-  if [ -x /bin/sleep ]; then
-    /bin/sleep "$sec"
-  elif [ -x "$B/sleep" ]; then
-    "$B/sleep" "$sec"
-  else
-    sleep "$sec"
-  fi
-}
-
-while :; do
-  sh "$M/capture.sh" >>"$L" 2>&1
-  if [ -f "$L" ]; then
-    sz=$(wc -c < "$L")
-    [ "$sz" -gt 100000 ] && { tail -c 20000 "$L" >"$L.t" && mv "$L.t" "$L"; }
-  fi
-  nap 20
-done
+# RETIRED. Do not run this 20s loop.
+#
+# Default harvest is Android Job 20 → ~/.messages/capture.sh every 15 minutes
+# (termux-job-scheduler --period-ms 900000). See ../PHONE_SETUP.md.
+# Jobs 21/22 (content://call_log, content://sms) hang Termux:API and must
+# not be installed. This script previously re-armed them via install-jobs.sh.
+#
+# Kept on the phone so a leftover bashrc/boot line fails closed instead of
+# starting a loop or re-hanging JobScheduler.
+echo "daemon.sh is retired; Job 20 (15 min capture.sh) is the default." >&2
+exit 1

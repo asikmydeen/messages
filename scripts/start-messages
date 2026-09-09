@@ -1,0 +1,11 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Termux:Boot — restore messages-hub capture after reboot.
+# Job 20 (15 min) is the default. Do not start daemon.sh (20s loop).
+# Jobs 21/22 (content://sms and call_log) hang Termux:API — do not install them.
+# SSH lives in a sibling boot script (start-sshd); do not fold it in here.
+termux-wake-lock 2>/dev/null
+am startservice --user 0 -n com.termux.api/.KeepAliveService >/dev/null 2>&1 || true
+B=/data/data/com.termux/files/usr/bin
+S=/data/data/com.termux/files/home/.messages/capture.sh
+$B/termux-job-scheduler --job-id 20 --script "$S" --period-ms 900000 \
+  --persisted true --battery-not-low false --network any

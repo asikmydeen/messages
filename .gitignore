@@ -7,3 +7,9 @@ target/
 dist/
 .next/
 .ship.json
+# Device harvest state — never commit
+token
+last.*
+*.pid
+*.log
+

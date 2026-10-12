@@ -10,6 +10,7 @@ const FEED_PASS = process.env.FEED_PASS || ''
 const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '')
 const SB_KEY = process.env.SUPABASE_ANON_KEY || ''
 const QDRANT_URL = (process.env.QDRANT_URL || '').replace(/\/$/, '')
+const QDRANT_HEADERS = { 'Content-Type': 'application/json', ...(process.env.QDRANT_API_KEY ? { 'api-key': process.env.QDRANT_API_KEY } : {}) }
 const OLLAMA_URL = (process.env.OLLAMA_URL || '').replace(/\/$/, '')
 let GMAIL_ACCOUNTS = []
 try { GMAIL_ACCOUNTS = JSON.parse(process.env.GMAIL_ACCOUNTS || '[]') } catch { GMAIL_ACCOUNTS = [] }
@@ -196,7 +197,7 @@ async function embedAndStore(rows) {
     }))
     const qr = await fetch(`${QDRANT_URL}/collections/messages/points?wait=true`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: QDRANT_HEADERS,
       body: JSON.stringify({ points }),
     })
     if (!qr.ok) throw new Error(`qdrant ${qr.status}: ${(await qr.text()).slice(0, 120)}`)
@@ -388,7 +389,7 @@ app.get('/search', async (c) => {
     if (appF) must.push({ key: 'app', match: { keyword: appF } })
     const r = await fetch(`${QDRANT_URL}/collections/messages/points/scroll`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: QDRANT_HEADERS,
       body: JSON.stringify({ filter: { must }, limit, with_payload: true }),
     })
     if (!r.ok) throw new Error(`qdrant ${r.status}: ${(await r.text()).slice(0, 120)}`)

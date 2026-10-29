@@ -132,7 +132,34 @@ Hub / brain:
 - `GET https://messages.asikmydeen.com/messages?limit=5` (Basic auth) should show recent rows.
 - Qdrant collection `messages` should grow. Points use `source=sms|notification|call|gmail` as applicable. Today’s live hub may still store folded calls as `source=sms` until `parseCalls` from commit `7c5a786` is deployed (do not deploy from this setup).
 
-## 7. SSH and the Ubuntu proot trap
+## 7. Survive Termux quit (Z Fold / Samsung)
+
+Job 20 is persisted. Swiping Termux away does **not** uninstall it. What kills harvest is Samsung sleeping **Termux:API**, force-stop, or a reboot without Termux:Boot.
+
+`arm.sh` (KeepAlive + Job 20 + ongoing notification) runs from:
+
+- Termux:Boot `~/.termux/boot/start-messages` (device reboot)
+- Termux `~/.bashrc` **above** `proot-distro login ubuntu` (every Termux open)
+- Termux:Widget `friday-harvest` (manual)
+- Each `capture.sh` (refreshes the notice)
+
+Do this once in Android settings (APIs cannot):
+
+1. Settings → Apps → **Termux**, **Termux:API**, **Termux:Boot** → Battery → **Unrestricted**
+2. Settings → Battery → Background usage limits → **Never sleeping apps** → add those three
+3. Recents → Termux → lock/keep open (pin)
+4. Never **Force stop** Termux or Termux:API
+5. Termux:API notification listener still on
+
+Do **not** bring back `daemon.sh`. A 20s wake-lock loop is what we retired.
+
+Backup from m4 when Fold is on the mesh:
+
+```cron
+*/15 * * * * ssh -o BatchMode=yes -o ConnectTimeout=8 -p 8023 fold /data/data/com.termux/files/home/.messages/capture.sh >/tmp/fold-harvest.log 2>&1
+```
+
+## 8. SSH and the Ubuntu proot trap
 
 Fold (and a new phone, if you want the same ops) uses **Termux OpenSSH**, not Dropbear:
 

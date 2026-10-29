@@ -49,6 +49,10 @@ json_file_or_empty() {
 if [ -x "$TB/am" ]; then
   "$TB/am" startservice --user 0 -n com.termux.api/.KeepAliveService >/dev/null 2>&1 || true
 fi
+if [ -x "$TB/termux-wake-lock" ]; then
+  "$TB/termux-wake-lock" >/dev/null 2>&1 || true
+  trap "$TB/termux-wake-unlock >/dev/null 2>&1 || true" EXIT
+fi
 
 # Order is load-bearing: shade last, short timeout.
 run_to 15 "$DIR/last.sms.json" "$TB/termux-sms-list" --message-limit=50
@@ -86,8 +90,19 @@ H=""
 if [ -n "$HASHBIN" ]; then
   H=$(printf '%s\n%s\n%s' "$N" "$S" "$C" | $HASHBIN | awk '{print $1}')
 fi
+log() {
+  echo "$(date -Iseconds) $*" >> "$DIR/capture.log"
+}
+
+stamp_ok() {
+  date '+%Y-%m-%d %H:%M' > "$DIR/last.ok"
+  [ -x "$DIR/arm.sh" ] && sh "$DIR/arm.sh" --notify-only
+}
+
 if [ -n "$H" ] && [ -f "$DIR/last.hash" ] && [ "$H" = "$(cat "$DIR/last.hash")" ]; then
   echo '{"skipped":"unchanged"}'
+  log "skipped unchanged"
+  stamp_ok
   exit 0
 fi
 
@@ -95,9 +110,14 @@ BODY="$DIR/last.body"
 printf '{"postedAt":%s,"notifications":%s,"sms":%s,"calls":%s}\n' "$(date +%s000)" "$N" "$S" "$C" > "$BODY"
 CURL="$TB/curl"
 [ -x "$CURL" ] || CURL=curl
-$CURL -s -m 45 -X POST "$HUB/ingest/raw" \
+RESP=$($CURL -s -m 45 -X POST "$HUB/ingest/raw" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  --data-binary @"$BODY"
+  --data-binary @"$BODY")
+echo "$RESP"
 echo
-[ -n "$H" ] && echo "$H" > "$DIR/last.hash"
+if [ -n "$H" ]; then
+  echo "$H" > "$DIR/last.hash"
+fi
+log "posted ${RESP:-no-response}"
+stamp_ok

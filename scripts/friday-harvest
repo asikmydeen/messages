@@ -1,0 +1,5 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Termux:Widget — tap to re-arm harvest and capture now.
+H=/data/data/com.termux/files/home
+sh "$H/.messages/arm.sh"
+exec sh "$H/.messages/capture.sh"

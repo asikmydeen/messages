@@ -1,5 +1,6 @@
 import { ImapFlow } from 'imapflow'
 import crypto from 'node:crypto'
+import tls from 'node:tls'
 
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 40)
 
@@ -46,21 +47,26 @@ export async function fetchGmail({ user, pass, since, onProgress }) {
     host: 'imap.gmail.com', port: 993, secure: true,
     auth: { user, pass },
     logger: false, emitLogs: false,
-    greetingTimeout: 30000, socketTimeout: 300000,
+    greetingTimeout: Number(process.env.GMAIL_IMAP_GREETING_MS || 20_000),
+    socketTimeout: Number(process.env.GMAIL_IMAP_SOCKET_MS || 60_000),
   })
   await client.connect()
   try {
     const lock = await client.getMailboxLock('INBOX')
     const rows = []
+    let uidCount = 0
+    let keeperCount = 0
+    let skippedJunk = 0
     try {
       const uids = (await client.search({ since }, { uid: true })) || []
+      uidCount = uids.length
       // Phase 1: envelopes + labels only (cheap, streamable)
       const keepers = []
       for (let i = 0; i < uids.length; i += 50) {
         const batch = uids.slice(i, i + 50)
         for await (const msg of client.fetch(batch, { envelope: true, gmailLabels: true }, { uid: true })) {
           const labels = msg.gmailLabels || []
-          if (labels.some((l) => JUNK_LABELS.includes(l))) continue
+          if (labels.some((l) => JUNK_LABELS.includes(l))) { skippedJunk += 1; continue }
           const env = msg.envelope || {}
           const subject = (env.subject || '').trim()
           const from = env.from && env.from[0] ? (env.from[0].name ? `${env.from[0].name} <${env.from[0].address}>` : env.from[0].address || '') : ''
@@ -91,9 +97,11 @@ export async function fetchGmail({ user, pass, since, onProgress }) {
         })
         if (onProgress && i % 50 === 0) onProgress(i, keepers.length)
       }
+      keeperCount = keepers.length
     } finally {
       lock.release()
     }
+    console.log(`gmail imap ${user}: uids=${uidCount} keepers=${keeperCount} skippedJunk=${skippedJunk} rows=${rows.length}`)
     return rows
   } finally {
     await client.logout().catch(() => client.close())
@@ -125,4 +133,72 @@ function extractFromSource(source) {
   }
   if (/content-type:\s*text\/html/i.test(headers)) return stripHtml(decodePart(raw.slice(headerEnd - 2))).slice(0, 5000)
   return decodePart(raw.slice(headerEnd - 2)).trim()
+}
+
+function b64(s) {
+  return Buffer.from(String(s), 'utf8').toString('base64')
+}
+
+/** SMTP AUTH LOGIN over implicit TLS (Gmail app password). */
+export function smtpSend({ user, pass, to, subject, text }) {
+  return new Promise((resolve, reject) => {
+    const sock = tls.connect(465, 'smtp.gmail.com', { servername: 'smtp.gmail.com' })
+    let buf = ''
+    let step = 0
+    const timer = setTimeout(() => {
+      sock.destroy()
+      reject(new Error('smtp timeout'))
+    }, 20000)
+    const send = (line) => sock.write(line + '\r\n')
+    const fail = (msg) => {
+      clearTimeout(timer)
+      sock.destroy()
+      reject(new Error(msg))
+    }
+    sock.on('error', (e) => fail(e.message || 'smtp error'))
+    sock.on('data', (d) => {
+      buf += d.toString('utf8')
+      while (buf.includes('\n')) {
+        const i = buf.indexOf('\n')
+        const line = buf.slice(0, i).replace(/\r$/, '')
+        buf = buf.slice(i + 1)
+        if (!/^\d{3}[ -]/.test(line) || line[3] === '-') continue
+        const code = line.slice(0, 3)
+        if (step === 0) {
+          if (code !== '220') return fail(line)
+          send('EHLO friday.local'); step = 1
+        } else if (step === 1) {
+          send('AUTH LOGIN'); step = 2
+        } else if (step === 2) {
+          send(b64(user)); step = 3
+        } else if (step === 3) {
+          send(b64(pass)); step = 4
+        } else if (step === 4) {
+          if (code !== '235') return fail('smtp auth failed')
+          send(`MAIL FROM:<${user}>`); step = 5
+        } else if (step === 5) {
+          send(`RCPT TO:<${to}>`); step = 6
+        } else if (step === 6) {
+          send('DATA'); step = 7
+        } else if (step === 7) {
+          const payload = [
+            `From: ${user}`,
+            `To: ${to}`,
+            `Subject: ${subject}`,
+            'MIME-Version: 1.0',
+            'Content-Type: text/plain; charset=utf-8',
+            '',
+            text,
+            '.',
+          ].join('\r\n')
+          send(payload); step = 8
+        } else if (step === 8) {
+          send('QUIT'); step = 9
+          clearTimeout(timer)
+          sock.end()
+          resolve({ ok: true })
+        }
+      }
+    })
+  })
 }

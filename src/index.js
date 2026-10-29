@@ -1,7 +1,8 @@
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import crypto from 'node:crypto'
-import { fetchGmail } from './gmail.js'
+import { fetchGmail, smtpSend } from './gmail.js'
+import { buildRecentPath } from './recent_query.js'
 
 const PORT = Number(process.env.PORT || 3000)
 const INGEST_TOKEN = process.env.INGEST_TOKEN || ''
@@ -227,6 +228,16 @@ async function setSyncState(key, value) {
   })
 }
 
+const IMAP_BUDGET_MS = Number(process.env.GMAIL_IMAP_TIMEOUT_MS || 90_000)
+
+function withTimeout(promise, ms, label) {
+  let t
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${label} timeout`)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t))
+}
+
 async function syncOneAccount(acct, reason) {
   const st = { running: true, fetched: 0, inserted: 0, embedded: 0, error: null, lastOk: null }
   gmailStatus.accounts[acct.user] = st
@@ -234,25 +245,31 @@ async function syncOneAccount(acct, reason) {
     const last = await getSyncState(`gmail_last_date:${acct.user}`)
     // first run = 6-month backfill; afterwards daily increment (1-day overlap, dedup makes it safe)
     const since = last ? new Date(Number(last) - 86400000) : new Date(Date.now() - 182 * 86400000)
-    const rows = await fetchGmail({
+    const rows = await withTimeout(fetchGmail({
       user: acct.user, pass: acct.pass, since,
       onProgress: (done) => { st.fetched = done },
-    })
+    }), IMAP_BUDGET_MS, `imap ${acct.user}`)
     st.fetched = rows.length
     const insertedKeys = await insertRows(rows)
     st.inserted = insertedKeys.length
     if (insertedKeys.length) {
       const newRows = rows.filter((r) => insertedKeys.includes(r.dedup_key))
       for (let i = 0; i < newRows.length; i += 32) {
-        st.embedded += await embedAndStore(newRows.slice(i, i + 32))
+        try {
+          st.embedded += await embedAndStore(newRows.slice(i, i + 32))
+        } catch (e) {
+          console.error(`gmail embed ${acct.user}:`, e.message || e)
+        }
       }
     }
     await setSyncState(`gmail_last_date:${acct.user}`, Date.now())
     st.lastOk = new Date().toISOString()
+    st.error = null
     console.log(`gmail sync ${acct.user} (${reason}): fetched=${rows.length} inserted=${st.inserted} embedded=${st.embedded}`)
   } catch (e) {
     st.error = String(e.message || e)
     console.error(`gmail sync ${acct.user} failed:`, st.error)
+    // Do not advance gmail_last_date — the next hourly pass retries this window.
   } finally {
     st.running = false
   }
@@ -274,7 +291,20 @@ async function runGmailSync(reason) {
 
 const app = new Hono()
 
-app.get('/health', (c) => c.json({ ok: true, gmailAccounts: GMAIL_ACCOUNTS.length }))
+app.get('/health', (c) => {
+  const gmailErrors = {}
+  for (const [user, st] of Object.entries(gmailStatus.accounts)) {
+    if (st && st.error) gmailErrors[user] = String(st.error).slice(0, 160)
+  }
+  return c.json({
+    ok: true,
+    gmailAccounts: GMAIL_ACCOUNTS.length,
+    gmailLastRun: gmailStatus.lastRun,
+    gmailRunning: gmailStatus.running,
+    gmailDegraded: Object.keys(gmailErrors).length > 0,
+    gmailErrors,
+  })
+})
 
 app.use('/ingest/*', async (c, next) => {
   const got = c.req.header('Authorization') || ''
@@ -327,6 +357,48 @@ app.post('/ingest/gmail-sync', (c) => {
 })
 
 app.get('/ingest/gmail-status', (c) => c.json(gmailStatus))
+
+// Recency feed for Friday briefings (Bearer INGEST_TOKEN, same as other /ingest/*).
+app.get('/ingest/recent', async (c) => {
+  const built = buildRecentPath({
+    hours: c.req.query('hours'),
+    limit: c.req.query('limit'),
+    sources: c.req.query('sources'),
+  })
+  try {
+    const r = await pgr(built.path)
+    const raw = await r.json()
+    const rows = Array.isArray(raw) ? raw : []
+    const items = rows.map((m) => ({
+      id: m.id, source: m.source,
+      app: dec(m.app_enc), title: dec(m.title_enc), sender: dec(m.sender_enc),
+      body: dec(m.body_enc), msg_time: m.msg_time, posted_at: m.posted_at,
+    }))
+    return c.json({ hours: built.hours, since: built.since, count: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e.message || e) }, 502)
+  }
+})
+
+app.post('/ingest/gmail-send', async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const to = String(body.to || '').trim()
+  const subject = String(body.subject || '').trim().slice(0, 200)
+  const text = String(body.body || body.text || '').trim()
+  const want = String(body.account || '').trim().toLowerCase()
+  if (!to || !to.includes('@') || !text) {
+    return c.json({ ok: false, error: 'need to, subject, body' }, 400)
+  }
+  const acct = GMAIL_ACCOUNTS.find((a) => (a.user || '').toLowerCase() === want)
+    || GMAIL_ACCOUNTS[0]
+  if (!acct) return c.json({ ok: false, error: 'no gmail account' }, 400)
+  try {
+    await smtpSend({ user: acct.user, pass: acct.pass, to, subject: subject || '(no subject)', text: text.slice(0, 8000) })
+    return c.json({ ok: true, from: acct.user, to })
+  } catch (e) {
+    return c.json({ ok: false, error: 'send failed' }, 502)
+  }
+})
 
 // Auth: Basic header, session cookie, or login link /?key=<password>.
 // On any Basic-auth success we ALSO plant the session cookie — some browsers
@@ -494,7 +566,9 @@ app.get('/', (c) => c.html(PAGE))
 serve({ fetch: app.fetch, port: PORT }, (info) => {
   console.log(`messages-hub on :${info.port} → ${SB_URL}${QDRANT_URL ? ' + brain' : ''} + ${GMAIL_ACCOUNTS.length} gmail account(s)`)
   if (GMAIL_ACCOUNTS.length) {
-    setTimeout(() => runGmailSync('boot').catch(() => {}), 15000)
-    setInterval(() => runGmailSync('daily').catch(() => {}), 24 * 3600 * 1000)
+    const gmailEveryMs = Number(process.env.GMAIL_SYNC_MS || 3600 * 1000)
+    console.log(`gmail sync every ${Math.round(gmailEveryMs / 60000)} min`)
+    setTimeout(() => runGmailSync('boot').catch((e) => console.error('gmail boot', e)), 15000)
+    setInterval(() => runGmailSync('hourly').catch((e) => console.error('gmail hourly', e)), gmailEveryMs)
   }
 })
